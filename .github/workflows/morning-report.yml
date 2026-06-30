@@ -21,8 +21,21 @@ jobs:
       - name: Install package
         run: python -m pip install -e ".[tts]"
 
+      - name: Run tests
+        run: python -m unittest discover -s tests
+
+      - name: Prepare projects config
+        run: |
+          if [ -n "$PROJECTS_JSON" ]; then
+            printf '%s' "$PROJECTS_JSON" > config/projects.json
+            echo "PROJECTS_PATH=config/projects.json" >> "$GITHUB_ENV"
+          else
+            echo "PROJECTS_PATH=config/projects.example.json" >> "$GITHUB_ENV"
+          fi
+        env:
+          PROJECTS_JSON: ${{ secrets.PROJECTS_JSON }}
+
       - name: Send morning report
-        run: python -m morning_report --projects config/projects.example.json --out-dir out --tts-provider edge --send-discord
+        run: python -m morning_report --projects "$PROJECTS_PATH" --out-dir out --timezone Australia/Sydney --tts-provider edge --send discord
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-

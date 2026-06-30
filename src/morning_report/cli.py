@@ -7,10 +7,12 @@ import json
 import mimetypes
 import os
 from pathlib import Path
+import subprocess
 import sys
 import urllib.error
 import urllib.request
 import uuid
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 def load_active_projects(path: Path) -> list[dict]:
@@ -36,8 +38,17 @@ def _join_items(value: object) -> str:
     return str(value).strip()
 
 
+def current_time(timezone_name: str) -> dt.datetime:
+    try:
+        timezone = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError as exc:
+        raise ValueError(f"Unknown timezone: {timezone_name}") from exc
+
+    return dt.datetime.now(timezone)
+
+
 def build_report(projects: list[dict], now: dt.datetime | None = None) -> str:
-    current = now or dt.datetime.now()
+    current = now or current_time("Australia/Sydney")
     lines = [
         f"早上好，今天是 {current:%Y-%m-%d}。",
         "以下是正在推进项目的早报。",
@@ -84,6 +95,114 @@ async def synthesize_edge_tts(text: str, output_path: Path, voice: str) -> None:
     await communicate.save(str(output_path))
 
 
+def synthesize_openai_tts(
+    text: str,
+    output_path: Path,
+    api_key: str,
+    model: str,
+    voice: str,
+    instructions: str,
+) -> None:
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is required when --tts-provider openai is set.")
+
+    payload = {
+        "model": model,
+        "voice": voice,
+        "input": text,
+        "response_format": "mp3",
+    }
+    if instructions:
+        payload["instructions"] = instructions
+
+    request = urllib.request.Request(
+        "https://api.openai.com/v1/audio/speech",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            output_path.write_bytes(response.read())
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"OpenAI TTS failed with HTTP {exc.code}: {detail}") from exc
+
+
+def synthesize_piper_tts(
+    text: str,
+    output_path: Path,
+    piper_bin: str,
+    model_path: str,
+    config_path: str,
+    timeout_seconds: int,
+) -> None:
+    if not model_path:
+        raise RuntimeError("PIPER_MODEL is required when --tts-provider piper is set.")
+
+    args = [piper_bin, "--model", model_path, "--output_file", str(output_path)]
+    if config_path:
+        args.extend(["--config", config_path])
+
+    try:
+        result = subprocess.run(
+            args,
+            input=text,
+            text=True,
+            capture_output=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"Piper binary not found: {piper_bin}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"Piper timed out after {timeout_seconds} seconds.") from exc
+
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"Piper exited with code {result.returncode}."
+        raise RuntimeError(detail)
+
+
+def audio_extension(tts_provider: str) -> str:
+    if tts_provider == "piper":
+        return "wav"
+    return "mp3"
+
+
+def synthesize_tts(text: str, output_path: Path, args: argparse.Namespace) -> None:
+    if args.tts_provider == "edge":
+        asyncio.run(synthesize_edge_tts(text, output_path, args.voice))
+        return
+
+    if args.tts_provider == "openai":
+        synthesize_openai_tts(
+            text,
+            output_path,
+            args.openai_api_key,
+            args.openai_tts_model,
+            args.voice,
+            args.tts_instructions,
+        )
+        return
+
+    if args.tts_provider == "piper":
+        synthesize_piper_tts(
+            text,
+            output_path,
+            args.piper_bin,
+            args.piper_model,
+            args.piper_config,
+            args.tts_timeout_seconds,
+        )
+        return
+
+    raise RuntimeError(f"Unsupported TTS provider: {args.tts_provider}")
+
+
 def post_discord_webhook(webhook_url: str, content: str, audio_path: Path | None = None) -> None:
     if audio_path is None:
         body = json.dumps({"content": content[:1900]}, ensure_ascii=False).encode("utf-8")
@@ -128,14 +247,35 @@ def post_discord_webhook(webhook_url: str, content: str, audio_path: Path | None
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"Discord webhook failed with HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Discord webhook failed: {exc.reason}") from exc
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate and send a Chinese morning report.")
     parser.add_argument("--projects", type=Path, default=Path("config/projects.json"))
     parser.add_argument("--out-dir", type=Path, default=Path("out"))
-    parser.add_argument("--tts-provider", choices=["none", "edge"], default=os.getenv("TTS_PROVIDER", "edge"))
+    parser.add_argument("--timezone", default=os.getenv("REPORT_TIMEZONE", "Australia/Sydney"))
+    parser.add_argument(
+        "--tts-provider",
+        choices=["none", "edge", "openai", "piper"],
+        default=os.getenv("TTS_PROVIDER", "edge"),
+    )
     parser.add_argument("--voice", default=os.getenv("TTS_VOICE", "zh-CN-XiaoxiaoNeural"))
+    parser.add_argument(
+        "--tts-instructions",
+        default=os.getenv("TTS_INSTRUCTIONS", "用自然清晰的中文播报。"),
+    )
+    parser.add_argument("--openai-api-key", default=os.getenv("OPENAI_API_KEY", ""))
+    parser.add_argument(
+        "--openai-tts-model",
+        default=os.getenv("OPENAI_TTS_MODEL", os.getenv("TTS_MODEL", "gpt-4o-mini-tts")),
+    )
+    parser.add_argument("--piper-bin", default=os.getenv("PIPER_BIN", "piper"))
+    parser.add_argument("--piper-model", default=os.getenv("PIPER_MODEL", ""))
+    parser.add_argument("--piper-config", default=os.getenv("PIPER_CONFIG", ""))
+    parser.add_argument("--tts-timeout-seconds", type=int, default=int(os.getenv("TTS_TIMEOUT_SECONDS", "120")))
+    parser.add_argument("--send", choices=["none", "discord"], default=os.getenv("SEND_PLATFORM", "none"))
     parser.add_argument("--send-discord", action="store_true")
     parser.add_argument("--discord-webhook-url", default=os.getenv("DISCORD_WEBHOOK_URL"))
     return parser.parse_args(argv)
@@ -146,19 +286,20 @@ def main(argv: list[str] | None = None) -> int:
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     projects = load_active_projects(args.projects)
-    report = build_report(projects)
+    report = build_report(projects, current_time(args.timezone))
 
     report_path = args.out_dir / "morning-report.txt"
     report_path.write_text(report, encoding="utf-8")
 
     audio_path: Path | None = None
-    if args.tts_provider == "edge":
-        audio_path = args.out_dir / "morning-report.mp3"
-        asyncio.run(synthesize_edge_tts(report, audio_path, args.voice))
+    if args.tts_provider != "none":
+        audio_path = args.out_dir / f"morning-report.{audio_extension(args.tts_provider)}"
+        synthesize_tts(report, audio_path, args)
 
-    if args.send_discord:
+    send_platform = "discord" if args.send_discord else args.send
+    if send_platform == "discord":
         if not args.discord_webhook_url:
-            raise RuntimeError("DISCORD_WEBHOOK_URL is required when --send-discord is set.")
+            raise RuntimeError("DISCORD_WEBHOOK_URL is required when sending to Discord.")
         post_discord_webhook(args.discord_webhook_url, report, audio_path)
 
     print(report)
@@ -170,4 +311,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
