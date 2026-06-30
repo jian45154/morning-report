@@ -1,0 +1,21 @@
+{
+  "projects": [
+    {
+      "name": "Morning Report",
+      "status": "active",
+      "goal": "每天早上自动汇总正在推进的项目，并发送中文语音报告。",
+      "progress": "完成项目骨架、Discord webhook 发送和语音生成流程。",
+      "next": "接入真实项目来源，并补充更多发送平台。",
+      "blockers": []
+    },
+    {
+      "name": "Paused Example",
+      "status": "paused",
+      "goal": "这个项目不会进入早报。",
+      "progress": "",
+      "next": "",
+      "blockers": ["等待重新启动"]
+    }
+  ]
+}
+
